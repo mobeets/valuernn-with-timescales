@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from model import ValueRNN_Timescales
+from model import LeakyValueRNN
 from valuernn.train import make_dataloader, train_model, probe_model
 from valuernn.tasks.inference import ValueInference
 
@@ -22,19 +22,26 @@ E = ValueInference(nepisodes=500,
 
 #%% make model
 
-hidden_size = 100 # number of hidden neurons
+hidden_size = 50 # number of hidden neurons
+comm_size = 1 # number of communication units
+
 gamma = 0.9 # discount factor
 alpha_dist = torch.Tensor((hidden_size//2)*[0.1] + (hidden_size//2)*[1.0])
 assert hidden_size % 2 == 0, "hidden_size must be even for alpha_dist to work"
 
-model = ValueRNN_Timescales(input_size=E.ncues + E.nrewards,
+model = LeakyValueRNN(input_size=E.ncues + E.nrewards,
                  output_size=E.nrewards,
                  alpha_dist=alpha_dist,
+                 comm_size=comm_size,
                  hidden_size=hidden_size, gamma=gamma)
 
 # plot distribution of integration timescales across units
 plt.figure(figsize=(3,3), dpi=300)
-plt.hist(model.rnn.cell.alpha, bins=np.linspace(0,1,11))
+if comm_size is None:
+    plt.hist(model.rnn.cell.alpha, bins=np.linspace(0,1,11))
+else:
+    plt.hist(model.rnn.f1.cell.alpha, bins=np.linspace(0,1,11), alpha=0.8)
+    plt.hist(model.rnn.f2.cell.alpha, bins=np.linspace(0,1,11), alpha=0.8)
 plt.xlim([0,1])
 plt.xlabel('timescale of integration')
 plt.ylabel('number of units')
@@ -44,8 +51,10 @@ plt.ylabel('number of units')
 epochs = 100
 batch_size = 50
 lmbda = 0.0 # for TD(λ)
+lr = 0.003
+
 dataloader = make_dataloader(E, batch_size=batch_size)
-scores, other_scores, weights = train_model(model, dataloader, optimizer=None, epochs=epochs, lmbda=lmbda)
+scores, other_scores, weights = train_model(model, dataloader, optimizer=None, epochs=epochs, lmbda=lmbda, lr=lr)
 plt.figure(figsize=(3,3), dpi=300), plt.plot(scores), plt.xlabel('# epochs'), plt.ylabel('loss')
 
 #%% probe model
@@ -93,15 +102,24 @@ for block in range(E.nblocks):
         mus[(block, cue)] = Z.copy()
 
 Z = (Z - Z.mean(axis=0)) / Z.std(axis=0) # z-score each unit
-ix = np.argmax(Z, axis=0) # find time of peak for each unit
-ix = np.argsort(ix) # sort by time of peak
+ixm = np.argmax(Z, axis=0) # find time of peak for each unit
+ix = np.argsort(ixm) # sort by time of peak
+# ix = np.arange(Z.shape[1]) # sort indices
 
+plt.figure(figsize=(4,3), dpi=300)
 plt.imshow(Z.T[ix], aspect='auto', cmap='viridis')
+plt.xticks(np.arange(Z.shape[0]), np.arange(Z.shape[0]) - E.iti_min)
 plt.colorbar()
 
 ys = np.arange(Z.shape[1])
-xs = model.rnn.cell.alpha[ix] * Z.shape[0]
+if comm_size is None:
+    alphas = model.rnn.cell.alpha.numpy()
+else:
+    alphas = np.hstack([model.rnn.f1.cell.alpha.numpy(), model.rnn.f2.cell.alpha.numpy()])
+xs = alphas[ix] * (Z.shape[0]-1)
 plt.plot(xs, ys, 'o', color='white', markersize=2, alpha=0.5)
+plt.xlabel('time steps rel. to cue onset')
+plt.ylabel('units (sorted by peak response time)')
 
 #%%
 
@@ -130,6 +148,7 @@ def dprime_vector(Z1, Z2):
     s = np.sqrt(0.5 * (v1 + v2))
     
     # avoid division by zero
+    s[s == 0] = np.nan  # set zero std to NaN to avoid division by zero
     dprimes = (m1 - m2) / s
     dprimes[s == 0] = np.nan
     
@@ -139,6 +158,11 @@ def dprime_vector(Z1, Z2):
 
 mus = {'block': [], 'cue': []}
 dprimes = {'block': [], 'cue': []}
+
+# t_pre = E.iti_min
+t_pre = 1
+t_post = 1
+
 for block in range(E.nblocks):
     Zs_block = []
     for trial in trials:
@@ -146,7 +170,8 @@ for block in range(E.nblocks):
             continue
         if trial.block_index == block:
             continue
-        Zs_block.append(trial.Z[trial.iti-E.iti_min:trial.iti].mean(axis=0))
+        # Zs_block.append(trial.Z[trial.iti-t_pre:trial.iti].mean(axis=0))
+        Zs_block.extend(trial.Z[trial.iti-t_pre:trial.iti])
     Z = np.dstack(Zs_block).T[:,:,0]
     mus['block'].append(Z.copy())
 assert len(mus['block']) == 2
@@ -162,7 +187,8 @@ for cue in range(E.ncues):
             continue
         if trial.cue == cue:
             continue
-        Zs_cue.append(trial.Z[trial.iti:trial.iti+trial.isi].mean(axis=0))
+        # Zs_cue.append(trial.Z[trial.iti:trial.iti+trial.isi].mean(axis=0))
+        Zs_cue.extend(trial.Z[trial.iti:trial.iti+t_post])
     Z = np.dstack(Zs_cue).T[:,:,0]
     mus['cue'].append(Z.copy())
 assert len(mus['cue']) == 2
@@ -171,7 +197,11 @@ dprimes['cue'] = np.abs(dprime_vector(mus['cue'][0], mus['cue'][1]))
 Zss = []
 Zss.append(dprimes['block'])
 Zss.append(dprimes['cue'])
-Zss.append(model.rnn.cell.alpha.numpy())
+if comm_size is None:
+    alphas = model.rnn.cell.alpha.numpy()
+else:
+    alphas = np.hstack([model.rnn.f1.cell.alpha.numpy(), model.rnn.f2.cell.alpha.numpy()])
+Zss.append(alphas)
 Z = np.vstack(Zss)
 print(Z.shape)
 
@@ -190,33 +220,36 @@ plt.ylabel("|d'|")
 plt.legend(fontsize=8)
 plt.show()
 
-if np.unique(model.rnn.cell.alpha).size == 2:
+if np.unique(alphas).size == 2:
     # plot hist of d' for each value of alpha
-    alphas = model.rnn.cell.alpha.numpy()
     plt.figure(figsize=(6,3), dpi=300)
     for alpha in np.unique(alphas):
         plt.subplot(1, 2, 1)
-        bins = np.linspace(dprimes['block'].min(), dprimes['block'].max(), 20)
+        bins = np.linspace(0, np.nanmax(dprimes['block']), 20)
         h = plt.hist(dprimes['block'][alphas == alpha], bins=bins, alpha=0.5, label=f"α={alpha:.2f}")
         # plot vertical line at median d'
         clr = h[-1][-1].get_facecolor()
-        plt.axvline(np.median(dprimes['block'][alphas == alpha]), color=clr, linestyle='--')
-
+        plt.axvline(np.nanmedian(dprimes['block'][alphas == alpha]), color=clr, linestyle='--')
         plt.xlabel("|d'| block")
         plt.ylabel("number of units")
+        plt.legend(fontsize=8)
+
         plt.subplot(1, 2, 2)
-        bins = np.linspace(dprimes['cue'].min(), dprimes['cue'].max(), 20)
+        bins = np.linspace(0, np.nanmax(dprimes['cue']), 20)
         h = plt.hist(dprimes['cue'][alphas == alpha], bins=bins, alpha=0.5, label=f"α={alpha:.2f}")
         # plot vertical line at median d'
         clr = h[-1][-1].get_facecolor()
-        plt.axvline(np.median(dprimes['cue'][alphas == alpha]), color=clr, linestyle='--')
+        plt.axvline(np.nanmedian(dprimes['cue'][alphas == alpha]), color=clr, linestyle='--')
         plt.xlabel("|d'| cue")
-    plt.legend(fontsize=8)
+        plt.legend(fontsize=8)
     plt.tight_layout()
     plt.show()
 
 plt.figure(figsize=(3,3), dpi=300)
-plt.imshow(np.corrcoef(Z), cmap='RdBu')
+row_means = np.nanmean(Z, axis=1, keepdims=True)
+Z_filled = np.where(np.isnan(Z), row_means, Z)
+corr_matrix = np.corrcoef(Z_filled)
+plt.imshow(corr_matrix, cmap='RdBu')
 plt.xticks([0,1,2], ['block |d\'|', 'cue |d\'|', 'alpha'])
 plt.yticks([0,1,2], ['block |d\'|', 'cue |d\'|', 'alpha'])
 # plt.axis('off')

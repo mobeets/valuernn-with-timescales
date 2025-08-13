@@ -7,11 +7,12 @@ from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
 #%%
 
-class ValueRNN_Timescales(nn.Module):
+class LeakyValueRNN(nn.Module):
     def __init__(self,
                 input_size=1, output_size=1, hidden_size=1, 
                 gamma=0.9, bias=True,
                 alpha_dist=None,
+                comm_size=None,
                 learn_weights=True, learn_initial_state=False):
         super().__init__()
 
@@ -19,8 +20,15 @@ class ValueRNN_Timescales(nn.Module):
         self.input_size = input_size # input dimensionality
         self.output_size = output_size # output dimensionality
         self.hidden_size = hidden_size # number of hidden recurrent units
+        self.comm_size = comm_size
 
-        self.rnn = TimescaleRNN(input_size=input_size, hidden_size=hidden_size, alpha_dist=alpha_dist)
+        if self.comm_size is None:
+            self.rnn = TimescaleRNN(input_size=input_size, hidden_size=hidden_size, alpha_dist=alpha_dist)
+        else:
+            if hidden_size % 2 != 0:
+                raise ValueError("hidden_size must be even for CoupledTimescaleRNNs (when comm_size is specified)")
+            self.rnn = CoupledTimescaleRNNs(input_size=input_size, hidden_size=hidden_size // 2, comm_size=self.comm_size, alpha_dist=alpha_dist)
+        
         self.recurrent_cell = 'RNN' # for compatibility with other code
 
         if learn_weights:
@@ -189,3 +197,57 @@ class TimescaleRNN(nn.Module):
         if self.batch_first:
             output = output.transpose(0, 1)  # back to (batch, seq, hidden)
         return output, h_t
+
+class CoupledTimescaleRNNs(nn.Module):
+    def __init__(self, input_size, hidden_size, comm_size, alpha_dist=None):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.comm_size = comm_size
+
+        alpha_dists = (alpha_dist[:hidden_size], alpha_dist[hidden_size:]) if alpha_dist is not None else (None, None)
+        self.f1 = TimescaleRNN(input_size + comm_size, hidden_size, alpha_dist=alpha_dists[0])
+        self.f2 = TimescaleRNN(input_size + comm_size, hidden_size, alpha_dist=alpha_dists[1])
+
+        # Communication projections (compact form)
+        self.C12 = nn.Parameter(torch.randn(hidden_size, comm_size) / comm_size**0.5)
+        self.C21 = nn.Parameter(torch.randn(hidden_size, comm_size) / comm_size**0.5)
+
+    def forward(self, input, hx=None):
+        packed_input = isinstance(input, torch.nn.utils.rnn.PackedSequence)
+        if packed_input:
+            x_unpacked, lengths = pad_packed_sequence(input)
+        else:
+            x_unpacked = input
+            lengths = None
+
+        seq_len, batch_size, _ = x_unpacked.size()
+
+        if hx is None:
+            h1 = x_unpacked.new_zeros(batch_size, self.hidden_size)
+            h2 = x_unpacked.new_zeros(batch_size, self.hidden_size)
+        else:
+            h1, h2 = torch.split(hx, self.hidden_size, dim=1)
+
+        outputs = []
+        for t in range(seq_len):
+            # Communication vectors from previous step
+            z2_comm = h2 @ self.C12  # (batch, comm_size)
+            z1_comm = h1 @ self.C21  # (batch, comm_size)
+
+            inp1 = torch.cat([x_unpacked[t], z2_comm], dim=-1)
+            inp2 = torch.cat([x_unpacked[t], z1_comm], dim=-1)
+
+            h1, _ = self.f2(inp1.unsqueeze(0), h1)
+            h1 = h1.squeeze(0)
+            h2, _ = self.f2(inp2.unsqueeze(0), h2)
+            h2 = h2.squeeze(0)
+
+            outputs.append(torch.cat([h1, h2], dim=-1).unsqueeze(0))
+
+        output = torch.cat(outputs, dim=0)
+        h_final = torch.cat([h1, h2], dim=-1)
+
+        if packed_input:
+            output = pack_padded_sequence(output, lengths, enforce_sorted=False)
+
+        return output, h_final
