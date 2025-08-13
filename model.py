@@ -53,9 +53,10 @@ class LeakyValueRNN(nn.Module):
         """ v(t) = w.dot(z(t)), and z(t) = f(x(t), z(t-1)) """
 
         if inactivation_indices is not None:
-            raise Exception("inactivation_indices not implemented for ValueRNN_Timescales")
+            return self.forward_with_lesion(X, inactivation_indices)
+            # raise Exception("inactivation_indices not implemented for LeakyValueRNN")
         if auto_readout_lr > 0:
-            raise Exception("auto_readout_lr not implemented for ValueRNN_Timescales")
+            raise Exception("auto_readout_lr not implemented for LeakyValueRNN")
         
         if type(X) is torch.nn.utils.rnn.PackedSequence:
             batch_size = len(X[2])
@@ -77,6 +78,47 @@ class LeakyValueRNN(nn.Module):
         hiddens = Z
 
         return V, (hiddens if return_hiddens else last_hidden)
+
+    def forward_with_lesion(self, x, indices=None):
+        hs = []
+        cs = []
+        os = []
+        # h_t = torch.zeros((1, x.shape[1], self.hidden_size))
+        h_t = torch.zeros((x.shape[1], self.hidden_size))
+        if self.recurrent_cell == 'LSTM':
+            c_t = torch.zeros((1, x.shape[1], self.hidden_size))
+            send_cell = True
+        else:
+            send_cell = False
+        for x_t in x:
+            h_t_cur = (h_t, c_t) if send_cell else h_t
+            # print(h_t_cur.shape)
+            o_t, h_t = self.rnn(x_t[None,:], h_t_cur)
+            if send_cell:
+                (h_t, c_t) = h_t
+            if len(h_t) == 0:
+                assert self.recurrent_cell.lower() in ['gru', 'rnn'] and self.rnn.sigma_noise > 0
+                h_t = o_t
+
+            if indices is not None:
+                for index in indices:
+                    if index > h_t.shape[-1]:
+                        raise Exception("Cannot lesion cell units in LSTM")
+                    # h_t.data[:,:,index] = 0
+                    h_t.data[:,index] = 0
+                    # n.b. can't lesion c_t in isolation b/c h_t depends on c_t
+            hs.append(h_t)
+            os.append(o_t)
+            if send_cell:
+                cs.append(c_t)                
+            
+        hs = torch.vstack(hs)
+        os = torch.vstack(os)
+        if send_cell:
+            cs = torch.vstack(cs)
+            hs = (hs, cs)
+        
+        return self.bias + self.value(os), hs
 
     def freeze_weights(self, substr=None):
         for name, p in self.named_parameters():

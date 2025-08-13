@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from model import LeakyValueRNN
+from analysis import dprime_vector
 from valuernn.train import make_dataloader, train_model, probe_model
 from valuernn.tasks.inference import ValueInference
 
@@ -46,6 +47,11 @@ plt.xlim([0,1])
 plt.xlabel('timescale of integration')
 plt.ylabel('number of units')
 
+#%% load weights from path
+
+fnm = 'models/leaky-rnn-model-50.pth'
+model.load_weights_from_path(fnm)
+
 #%% train model
 
 epochs = 100
@@ -59,30 +65,42 @@ plt.figure(figsize=(3,3), dpi=300), plt.plot(scores), plt.xlabel('# epochs'), pl
 
 #%% probe model
 
+inactivation_indices = None
+# inactivation_indices = np.arange(hidden_size // 2) # silence pop 1
+# inactivation_indices = np.arange(hidden_size // 2, hidden_size) # silence pop 2
+
 E.make_trials() # create new trials for testing
 dataloader = make_dataloader(E, batch_size=batch_size)
-trials = probe_model(model, dataloader)[1:] # ignore first trial
+trials = probe_model(model, dataloader, inactivation_indices=inactivation_indices)[1:] # ignore first trial
 
 #%% visualize value and rpe of example trial
+
+showRPE = False
 
 plt.figure(figsize=(4,6), dpi=300)
 for cue in range(E.ncues):
     clr = None
     for block in range(E.nblocks):
         linestyle = '.-' if block == 0 else '.--'
-        trial = next(trial for trial in trials if trial.cue == cue and trial.block_index == block and trial.rel_trial_index >= 2)
+        
+        cur_trials = [trial for trial in trials if trial.cue == cue and trial.block_index == block and trial.rel_trial_index >= 2]
+
+        vs = np.dstack([trial.value[trial.iti-E.iti_min:] for trial in cur_trials]).mean(axis=-1)
+        rpes = np.dstack([trial.rpe[trial.iti-E.iti_min:] for trial in cur_trials]).mean(axis=-1)
+
         ts = np.arange(len(trial)) - trial.iti + 1
         plt.subplot(2,1,1)
-        h = plt.plot(ts, trial.value, linestyle, label='block {}, cue {}'.format(block, cue), color=clr)
+        h = plt.plot(ts, vs, linestyle, label='block {}, cue {}'.format(block, cue), color=clr)
         if clr is None:
             clr = h[0].get_color()
         plt.xlim([-2, max(ts)])
         plt.ylabel('value')
         plt.legend(fontsize=8)
-        plt.subplot(2,1,2)
-        plt.plot(ts[:-1], trial.rpe, linestyle, color=clr)
-        plt.xlim([-2, max(ts)])
-        plt.ylabel('RPE')
+        if showRPE:
+            plt.subplot(2,1,2)
+            plt.plot(ts[:-1], rpes, linestyle, color=clr)
+            plt.xlim([-2, max(ts)])
+            plt.ylabel('RPE')
         plt.xlabel('time rel. to cue onset')
 plt.tight_layout()
 
@@ -108,7 +126,7 @@ ix = np.argsort(ixm) # sort by time of peak
 
 plt.figure(figsize=(4,3), dpi=300)
 plt.imshow(Z.T[ix], aspect='auto', cmap='viridis')
-plt.xticks(np.arange(Z.shape[0]), np.arange(Z.shape[0]) - E.iti_min)
+plt.xticks(np.arange(Z.shape[0]), np.arange(Z.shape[0]) - E.iti_min + 1)
 plt.colorbar()
 
 ys = np.arange(Z.shape[1])
@@ -120,39 +138,6 @@ xs = alphas[ix] * (Z.shape[0]-1)
 plt.plot(xs, ys, 'o', color='white', markersize=2, alpha=0.5)
 plt.xlabel('time steps rel. to cue onset')
 plt.ylabel('units (sorted by peak response time)')
-
-#%%
-
-def dprime_vector(Z1, Z2):
-    """
-    Compute per-feature d' between Z1 and Z2.
-    
-    Parameters
-    ----------
-    Z1 : ndarray of shape (T1, N)
-        First set of samples (T1 trials, N features).
-    Z2 : ndarray of shape (T2, N)
-        Second set of samples (T2 trials, N features).
-    
-    Returns
-    -------
-    dprimes : ndarray of shape (N,)
-        d' value for each feature.
-    """
-    m1 = Z1.mean(axis=0)
-    m2 = Z2.mean(axis=0)
-    v1 = Z1.var(axis=0, ddof=1)  # unbiased variance
-    v2 = Z2.var(axis=0, ddof=1)
-    
-    # pooled std
-    s = np.sqrt(0.5 * (v1 + v2))
-    
-    # avoid division by zero
-    s[s == 0] = np.nan  # set zero std to NaN to avoid division by zero
-    dprimes = (m1 - m2) / s
-    dprimes[s == 0] = np.nan
-    
-    return dprimes
 
 #%% find block-representing and cue-representing units, and compare to alpha
 
@@ -257,4 +242,43 @@ plt.clim([-1,1])
 plt.colorbar(fraction=0.03, pad=0.04)
 plt.show()
 
-#%%
+#%% visualize average activity of low and high d' units
+
+dps = dprimes['block'].copy()
+dps[np.isnan(dps)] = np.nanmedian(dps) # replace NaNs with median
+block_dprimes = np.argsort(dps)
+group1 = block_dprimes[:10]
+group2 = block_dprimes[-10:]
+names = ['low d\'', 'high d\'']
+
+# group1 = np.arange(25); group2 = np.arange(25, 50); names = ['pop 1', 'pop 2']
+
+print(dps[group1].mean(), dps[group2].mean())
+
+plt.figure(figsize=(6,3), dpi=300)
+mus = {}
+for block in range(E.nblocks):
+    for cue in range(E.ncues):
+        Zs = []
+        for trial in trials:
+            if trial.rel_trial_index <= 2:
+                continue
+            if trial.block_index != block:
+                continue
+            if trial.cue != cue:
+                continue
+            Zs.append(trial.Z[(trial.iti-E.iti_min):])
+        Z = np.dstack(Zs).mean(axis=-1) # average across trials
+        mus[(block, cue)] = Z.copy()
+
+        xs = np.arange(Z.shape[0]) - E.iti_min + 1
+        plt.subplot(1,2,1)
+        plt.plot(xs, Z[:,group1].mean(axis=1), '-' if block == 0 else '--', color='blue' if cue == 0 else 'orange', label=f'cue={cue}, block={block}')
+        plt.title(names[0])
+        plt.subplot(1,2,2)
+        plt.plot(xs, Z[:,group2].mean(axis=1), '-' if block == 0 else '--', color='blue' if cue == 0 else 'orange', label=f'cue={cue}, block={block}')
+        plt.xlabel('time rel. to cue onset')
+        plt.ylabel('activity')
+        plt.title(names[1])
+        plt.legend(fontsize=8)
+plt.tight_layout()
